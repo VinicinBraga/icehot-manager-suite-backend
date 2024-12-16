@@ -1,33 +1,25 @@
-(x) ggl_dates
-(x) ggl_generating_all_accounts_ids
-(x) ggl_generating_days_for_all_accounts
-(x) ggl_getting_metrics_of_accounts
-(x) ggl_accounts_with_all_days_and_cumulative_metrics
-(x) ggl_adding_digital_marketing_metrics
-(x) ggl_getting_necessary_metrics_for_projection
-(x) ggl_calculating_avg_cost
-(x) ggl_rounded_avg_cost_of_last_day
-(x) ggl_projections_for_all_month
-(x) ggl_base_array
-(x) ggl_goals
-(x) ggl_joining_tables_and_adding_features
-(x) ggl_aggregating_metrics
-(x) ggl_projecoes_final
+Não teria como ser mais simples, onde: 
+Se o (email) existir no campo EMAIL_ACCESS da tabela acesso_sm e o campo POSITION na tabela acesso_sm for igual a PROPRIETARIO, a tabela base_sm retorna toda.
 
-VocẼ é pago para que?
-Para entregar olução!!
-E mais do que entrgar a solução e saber definir o processo nessa solução
+Caso contrario:
 
-Voce tem que ser "dispensável":(É a forma mais dispensavel para evoluir) 
-Quem entrar no meu lugar tem que saber fazer o que eu sei fazer e ai eu posso ser deslocado para a coordenação;
+Se o (email) existir no campo EMAIL_ACCESS da tabela acesso_sm e o campo POSITION na tabela acesso_sm for igual a RP, a tabela base_sm retorna somente os campos LOCAL na tabela acesso_sm cruzada com a  base_sm for igual a SP.
 
-Como que eu meço sua performance?
-O resultado da ação. 
-Planilha RICE (Resultado confianca, impacto, esforço)
+Caso contrario:
 
-Smartview:
+Se o (email) existir no campo EMAIL_ACCESS da tabela acesso_sm e o campo GERENTE na tabela acesso_sm for igual a CAROLINA GIORGI, a tabela base_sm retorna somente os campos GERENTE na tabela acesso_sm cruzada com a  base_sm for igual a CAROLINA GIORGI.
 
-qualidade de 
+Caso contrário:
 
+Se o (email) existir no campo EMAIL_ACCESS da tabela acesso_sm e o campo GERENTE na tabela acesso_sm for igual a ADELIA VILANOVA, a tabela base_sm retorna somente os campos GERENTE na tabela acesso_sm cruzada com a  base_sm for igual a ADELIA VILANOVA.
 
-de tudo que eu faço, qual a minha principal tarefa
+Caso contrário:
+
+Se o (email) existir no campo EMAIL_ACCESS da tabela acesso_sm e o campo GERENTE na tabela acesso_sm for igual a LUCINDO SOARES, a tabela base_sm retorna somente os campos GERENTE na tabela acesso_sm cruzada com a  base_sm for igual a LUCINDO SOARES.
+
+Caso contrário:
+
+Se o (email) existir no campo EMAIL_ACCESS da tabela acesso_sm e o campo GERENTE na tabela acesso_sm for igual a DENISE FERRETTI, a tabela base_sm retorna somente os campos GERENTE na tabela acesso_sm cruzada com a  base_sm for igual a DENISE FERRETTI.
+
+Caso contrário:
+Se o (email) existir no campo EMAIL_ACCESS da tabela acesso_sm e o campo POSITION na tabela acesso_sm for igual a VENDEDOR, a tabela base_sm retorna somente os campos EMAIL_ACCESS na tabela acesso_sm cruzada com a  base_sm for igual ao (email)  .
