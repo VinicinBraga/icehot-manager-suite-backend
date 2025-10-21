@@ -33,7 +33,7 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  connectTimeout: 8000, // 8s para abrir conexão
+  connectTimeout: 8000,
   enableKeepAlive: true,
 });
 
@@ -63,15 +63,96 @@ function normalizeStatusToCode(input) {
   if (raw === "0" || raw === "ativo") return 0;
   if (raw === "1" || raw === "atendimento") return 1;
   if (raw === "2" || raw === "desativado") return 2;
-  return 0; // default seguro
+  return 0;
 }
 
-// ===== /ping: sem DB (para testar o servidor)
+/** Normaliza string: sem acento/caixa/espacos extras */
+function normalizeName(s = "") {
+  return String(s)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+/** Busca cidade sem acento/caixa; se não achar e UF vier, cria; se precisar criar e faltar UF -> erro 400 */
+async function ensureCityByName(pool, nomeCidadeRaw, ufRaw = null) {
+  const nomeCidade = String(nomeCidadeRaw || "").trim();
+  if (!nomeCidade) return null;
+
+  const norm = normalizeName(nomeCidade);
+  const uf = ufRaw ? String(ufRaw).trim().toUpperCase() : null;
+
+  // 1) tenta match exato por nome + (UF se vier)
+  {
+    const sql = uf
+      ? "SELECT id, nome, uf FROM cidades WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?)) AND UPPER(TRIM(uf)) = UPPER(TRIM(?)) LIMIT 2"
+      : "SELECT id, nome, uf FROM cidades WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?)) LIMIT 2";
+    const params = uf ? [nomeCidade, uf] : [nomeCidade];
+
+    const [rows] = await withTimeout(
+      pool.execute(sql, params),
+      4000,
+      "db_timeout"
+    );
+    if (rows.length === 1) return rows[0];
+    if (rows.length > 1) {
+      throw new Error(
+        uf
+          ? `Cidade ambígua: existe mais de uma "${nomeCidade}/${uf}".`
+          : `Cidade ambígua para "${nomeCidade}". Especifique UF (ex.: "${nomeCidade}/UF").`
+      );
+    }
+  }
+
+  // 2) tenta variantes sem acento (prefixo e filtro em JS)
+  {
+    const prefix = nomeCidade.slice(0, 4);
+    const sql = uf
+      ? "SELECT id, nome, uf FROM cidades WHERE UPPER(TRIM(uf)) = UPPER(TRIM(?)) AND nome LIKE ? ORDER BY nome LIMIT 20"
+      : "SELECT id, nome, uf FROM cidades WHERE nome LIKE ? ORDER BY nome LIMIT 20";
+    const params = uf ? [uf, `${prefix}%`] : [`${prefix}%`];
+
+    const [rows] = await withTimeout(
+      pool.execute(sql, params),
+      4000,
+      "db_timeout"
+    );
+    const filtered = rows.filter((r) => normalizeName(r.nome) === norm);
+    if (filtered.length === 1) return filtered[0];
+    if (filtered.length > 1) {
+      throw new Error(
+        uf
+          ? `Cidade ambígua: existe mais de uma "${nomeCidade}/${uf}".`
+          : `Cidade ambígua para "${nomeCidade}". Especifique UF.`
+      );
+    }
+  }
+
+  // 3) não achou —> criar
+  if (!uf) {
+    const err = new Error("UF obrigatória para criar nova cidade.");
+    err._badRequest = true;
+    throw err;
+  }
+
+  const [res] = await withTimeout(
+    pool.execute("INSERT INTO cidades (nome, uf) VALUES (?, ?)", [
+      nomeCidade,
+      uf,
+    ]),
+    4000,
+    "db_timeout"
+  );
+  return { id: res.insertId, nome: nomeCidade, uf };
+}
+
+// ===== /ping
 app.get("/ping", (_req, res) => {
   res.type("text").send("pong");
 });
 
-// ===== /diag: ver env lidas e testar conexão simples (sem expor senha)
+// ===== /diag
 app.get("/diag", async (_req, res) => {
   const info = {
     MYSQL_HOST: process.env.MYSQL_HOST,
@@ -103,7 +184,7 @@ app.get("/diag", async (_req, res) => {
   }
 });
 
-// ===== /health: tenta falar com o DB mas não trava a resposta
+// ===== /health
 app.get("/health", async (_req, res) => {
   try {
     const [rows] = await withTimeout(
@@ -124,14 +205,13 @@ app.get("/health", async (_req, res) => {
  * EQUIPAMENTOS
  * ========================================================================== */
 
-/** GET /equipamentos — lista maquinas (com paginação) */
 app.get("/equipamentos", async (req, res) => {
   try {
     const { limit, offset } = parseLimitOffset(req);
     const sql = `
       SELECT
         m.id, m.nome, m.serialNumber, m.numeroNotaFiscal, m.numeroSerieEquipamento,
-        m.tipo_id, m.cidade_id, c.nome AS cidade_nome,
+        m.tipo_id, m.cidade_id, c.nome AS cidade_nome, c.uf AS cidade_uf,
         m.cep, m.bairro, m.endereco, m.numero, m.complemento,
         m.data_instalacao, m.status, m.observacao, m.created_at, m.updated_at
       FROM maquinas m
@@ -153,7 +233,10 @@ app.get("/equipamentos", async (req, res) => {
 
 /**
  * POST /equipamentos
- * Campos mapeados 1:1 com a tabela `maquinas`.
+ * - cidade é OPCIONAL (cidade_id pode ser NULL)
+ * - se vier cidade e não existir, cria — mas para criar exige UF
+ * - matching sem acentos/caixa
+ * - aceita 'uf' no body ou no formato "Cidade/UF"
  */
 app.post("/equipamentos", async (req, res) => {
   try {
@@ -164,7 +247,8 @@ app.post("/equipamentos", async (req, res) => {
       numeroNotaFiscal,
       numeroSerieEquipamento,
       cidade, // aceita 'cidade' (ou 'cidade_nome')
-      cidade_nome,
+      cidade_nome, // idem
+      uf, // NEW: pode vir separado
       cep,
       bairro,
       endereco,
@@ -180,11 +264,7 @@ app.post("/equipamentos", async (req, res) => {
     if (!nome) missing.push("nome");
     if (!serialNumber) missing.push("serialNumber");
     if (!data_instalacao) missing.push("data_instalacao");
-    // aceita 0 (falsy) sem marcar como ausente
     if (status == null) missing.push("status");
-
-    const cidadeTexto = (cidade ?? cidade_nome ?? "").toString().trim();
-    if (!cidadeTexto) missing.push("cidade");
     if (missing.length) {
       return res.status(400).json({
         ok: false,
@@ -209,81 +289,41 @@ app.post("/equipamentos", async (req, res) => {
         .json({ ok: false, error: "serialNumber já cadastrado" });
     }
 
-    // ===== Resolver cidade (nome -> id) na tabela 'cidades' =====
-    // Suporta "Cidade/UF" (ex.: "Belo Horizonte/MG")
-    let nomeCidade = cidadeTexto,
-      uf = null;
-    const slash = cidadeTexto.indexOf("/");
-    if (slash > 0) {
-      nomeCidade = cidadeTexto.slice(0, slash).trim();
-      uf = cidadeTexto.slice(slash + 1).trim();
-    }
-
+    // ===== Resolver cidade (opcional)
+    const cidadeTexto = (cidade ?? cidade_nome ?? "").toString().trim();
     let cidadeId = null;
-    if (uf) {
-      // match por nome + UF
-      const [rowsUF] = await withTimeout(
-        pool.execute(
-          "SELECT id FROM cidades WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?)) AND UPPER(TRIM(uf)) = UPPER(TRIM(?)) LIMIT 2",
-          [nomeCidade, uf]
-        ),
-        4000,
-        "db_timeout"
-      );
-      if (rowsUF.length === 1) {
-        cidadeId = rowsUF[0].id;
-      } else if (rowsUF.length > 1) {
-        return res.status(409).json({
-          ok: false,
-          error: `Cidade ambígua: existe mais de uma "${nomeCidade}/${uf}".`,
-        });
-      }
-    }
+    let ufFinal =
+      String(uf || "")
+        .trim()
+        .toUpperCase() || null;
 
-    if (!cidadeId) {
-      // match exato por nome (sem UF)
-      const [rowsExact] = await withTimeout(
-        pool.execute(
-          "SELECT id FROM cidades WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?)) LIMIT 2",
-          [nomeCidade]
-        ),
-        4000,
-        "db_timeout"
-      );
-      if (rowsExact.length === 1) {
-        cidadeId = rowsExact[0].id;
-      } else if (rowsExact.length > 1) {
-        return res.status(409).json({
-          ok: false,
-          error: `Cidade ambígua para "${nomeCidade}". Especifique UF (ex.: "${nomeCidade}/UF").`,
-        });
-      } else {
-        // fallback: LIKE
-        const [rowsLike] = await withTimeout(
-          pool.execute(
-            "SELECT id FROM cidades WHERE nome LIKE ? ORDER BY nome LIMIT 2",
-            [`${nomeCidade}%`]
-          ),
-          4000,
-          "db_timeout"
-        );
-        if (rowsLike.length === 1) {
-          cidadeId = rowsLike[0].id;
-        } else if (rowsLike.length > 1) {
-          return res.status(409).json({
-            ok: false,
-            error: `Cidade ambígua: várias cidades começam com "${nomeCidade}". Especifique UF.`,
-          });
-        } else {
-          return res.status(404).json({
-            ok: false,
-            error: `Cidade "${cidadeTexto}" não encontrada.`,
-          });
+    if (cidadeTexto) {
+      let nomeCidade = cidadeTexto;
+      const slash = cidadeTexto.indexOf("/");
+      if (slash > 0) {
+        nomeCidade = cidadeTexto.slice(0, slash).trim();
+        ufFinal =
+          cidadeTexto
+            .slice(slash + 1)
+            .trim()
+            .toUpperCase() || ufFinal;
+      }
+
+      try {
+        const city = await ensureCityByName(pool, nomeCidade, ufFinal);
+        cidadeId = city?.id ?? null;
+      } catch (err) {
+        const msg = String(err?.message || err);
+        // erro de validação (ex.: UF obrigatória) -> 400
+        if (err && err._badRequest) {
+          return res.status(400).json({ ok: false, error: msg });
         }
+        // ambiguidade ou outro problema -> 409
+        return res.status(409).json({ ok: false, error: msg });
       }
     }
 
-    // ===== INSERT mantendo o schema (cidade_id) =====
+    // ===== INSERT (cidade_id pode ser NULL)
     const [result] = await withTimeout(
       pool.execute(
         `
@@ -301,7 +341,7 @@ app.post("/equipamentos", async (req, res) => {
            NOW(), NOW())
         `,
         [
-          Number(cidadeId),
+          cidadeId,
           Number(tipo_id),
           nome,
           serialNumber,
@@ -313,7 +353,7 @@ app.post("/equipamentos", async (req, res) => {
           cep || null,
           complemento || null,
           data_instalacao,
-          statusCode, // <<< grava 0/1/2
+          statusCode,
           observacao || null,
         ]
       ),
@@ -327,15 +367,15 @@ app.post("/equipamentos", async (req, res) => {
       message: "Equipamento cadastrado com sucesso",
     });
   } catch (e) {
-    const isTimeout = e && String(e.message).includes("db_timeout");
+    const msg = String(e?.message || e);
+    const isTimeout = msg.includes("db_timeout");
     console.error("[POST /equipamentos]", e);
     return res
       .status(isTimeout ? 504 : 500)
-      .json({ ok: false, error: isTimeout ? "MySQL timeout" : e.message });
+      .json({ ok: false, error: isTimeout ? "MySQL timeout" : msg });
   }
 });
 
-/** PUT /equipamentos/:id — atualizar status (0/1/2) */
 app.put("/equipamentos/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -390,11 +430,6 @@ app.put("/equipamentos/:id", async (req, res) => {
   }
 });
 
-/**
- * DELETE /equipamentos/:id
- * Soft delete: status = 2 (Desativado), mantém histórico.
- * ?hard=1 => hard delete (apenas para DEV/teste)
- */
 app.delete("/equipamentos/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -446,10 +481,9 @@ app.delete("/equipamentos/:id", async (req, res) => {
 });
 
 /* =============================================================================
- * MODELOS (tipos)
+ * MODELOS
  * ========================================================================== */
 
-/** GET /modelos — lista tipos (com paginação) */
 app.get("/modelos", async (req, res) => {
   try {
     const { limit, offset } = parseLimitOffset(req);
@@ -471,7 +505,6 @@ app.get("/modelos", async (req, res) => {
   }
 });
 
-/** POST /modelos — cria tipo */
 app.post("/modelos", async (req, res) => {
   try {
     const { nome } = req.body || {};
@@ -504,7 +537,6 @@ app.post("/modelos", async (req, res) => {
   }
 });
 
-/** PUT /modelos/:id — atualiza nome do tipo */
 app.put("/modelos/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -540,7 +572,6 @@ app.put("/modelos/:id", async (req, res) => {
   }
 });
 
-/** DELETE /modelos/:id — hard delete (tipos não tem deleted_at) */
 app.delete("/modelos/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -571,10 +602,9 @@ app.delete("/modelos/:id", async (req, res) => {
 });
 
 /* =============================================================================
- * USUÁRIOS (users)
+ * USUÁRIOS
  * ========================================================================== */
 
-/** GET /usuarios — lista usuários (com paginação) */
 app.get("/usuarios", async (req, res) => {
   try {
     const { limit, offset } = parseLimitOffset(req);
@@ -596,10 +626,6 @@ app.get("/usuarios", async (req, res) => {
   }
 });
 
-/**
- * POST /usuarios
- * Grava na tabela `users`.
- */
 app.post("/usuarios", async (req, res) => {
   try {
     const {
@@ -679,7 +705,6 @@ app.post("/usuarios", async (req, res) => {
   }
 });
 
-/** PUT /usuarios/:id — update parcial (hash de senha se enviado) */
 app.put("/usuarios/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -690,7 +715,7 @@ app.put("/usuarios/:id", async (req, res) => {
     const {
       name,
       email,
-      password, // opcional
+      password,
       type,
       photo,
       cidade_id,
@@ -793,9 +818,6 @@ app.put("/usuarios/:id", async (req, res) => {
       message: "Usuário atualizado com sucesso",
     });
   } catch (e) {
-    if (e && (e.code === "ER_DUP_ENTRY" || e.errno === 1062)) {
-      return res.status(409).json({ ok: false, error: "E-mail já cadastrado" });
-    }
     const isTimeout = e && String(e.message).includes("db_timeout");
     console.error("[PUT /usuarios/:id]", e);
     return res.status(isTimeout ? 504 : 500).json({
