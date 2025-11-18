@@ -208,18 +208,36 @@ app.get("/health", async (_req, res) => {
 app.get("/equipamentos", async (req, res) => {
   try {
     const { limit, offset } = parseLimitOffset(req);
+
     const sql = `
       SELECT
-        m.id, m.nome, m.serialNumber, m.numeroNotaFiscal, m.numeroSerieEquipamento,
-        m.tipo_id, m.cidade_id, c.nome AS cidade_nome, c.uf AS cidade_uf,
-        m.cep, m.bairro, m.endereco, m.numero, m.complemento,
-        m.data_instalacao, m.status, m.observacao, m.created_at, m.updated_at
+        m.id,
+        m.nome,
+        m.serialNumber,
+        m.numeroNotaFiscal,
+        m.numeroSerieEquipamento,
+        m.tipo_id,
+        m.cidade_id,
+        c.nome AS cidade_nome,
+        c.uf   AS cidade_uf,
+        m.cep,
+        m.bairro,
+        m.endereco,
+        m.numero,
+        m.complemento,
+        m.data_instalacao,
+        m.status,
+        m.observacao,
+        m.created_at,
+        m.updated_at
       FROM maquinas m
       LEFT JOIN cidades c ON c.id = m.cidade_id
       ORDER BY m.id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
+
     const [rows] = await withTimeout(pool.query(sql), 6000, "db_timeout");
+
     return res.json({ ok: true, data: rows, limit, offset });
   } catch (e) {
     const isTimeout = e && String(e.message).includes("db_timeout");
@@ -237,6 +255,7 @@ app.get("/equipamentos", async (req, res) => {
  * - se vier cidade e não existir, cria — mas para criar exige UF
  * - matching sem acentos/caixa
  * - aceita 'uf' no body ou no formato "Cidade/UF"
+ * - AGORA: se vier usuario_id, cria vínculo na tabela usuarios_equipamentos
  */
 app.post("/equipamentos", async (req, res) => {
   try {
@@ -248,7 +267,7 @@ app.post("/equipamentos", async (req, res) => {
       numeroSerieEquipamento,
       cidade, // aceita 'cidade' (ou 'cidade_nome')
       cidade_nome, // idem
-      uf, // NEW: pode vir separado
+      uf, // pode vir separado
       cep,
       bairro,
       endereco,
@@ -257,6 +276,7 @@ app.post("/equipamentos", async (req, res) => {
       data_instalacao,
       status,
       observacao,
+      usuario_id, // 👈 NOVO CAMPO PARA VÍNCULO COM USUÁRIO
     } = req.body || {};
 
     const missing = [];
@@ -265,6 +285,9 @@ app.post("/equipamentos", async (req, res) => {
     if (!serialNumber) missing.push("serialNumber");
     if (!data_instalacao) missing.push("data_instalacao");
     if (status == null) missing.push("status");
+    // se quiser tornar obrigatório já agora, descomenta:
+    // if (usuario_id == null) missing.push("usuario_id");
+
     if (missing.length) {
       return res.status(400).json({
         ok: false,
@@ -283,6 +306,7 @@ app.post("/equipamentos", async (req, res) => {
       4000,
       "db_timeout"
     );
+
     if (dups.length) {
       return res
         .status(409)
@@ -300,6 +324,7 @@ app.post("/equipamentos", async (req, res) => {
     if (cidadeTexto) {
       let nomeCidade = cidadeTexto;
       const slash = cidadeTexto.indexOf("/");
+
       if (slash > 0) {
         nomeCidade = cidadeTexto.slice(0, slash).trim();
         ufFinal =
@@ -323,7 +348,7 @@ app.post("/equipamentos", async (req, res) => {
       }
     }
 
-    // ===== INSERT (cidade_id pode ser NULL)
+    // ===== INSERT em maquinas (cidade_id pode ser NULL)
     const [result] = await withTimeout(
       pool.execute(
         `
@@ -361,9 +386,39 @@ app.post("/equipamentos", async (req, res) => {
       "db_timeout"
     );
 
+    const maquinaId = (result && result.insertId) || null;
+
+    // ===== NOVO: criar vínculo em usuarios_equipamentos, se usuario_id vier
+    if (usuario_id != null && maquinaId != null) {
+      try {
+        await withTimeout(
+          pool.execute(
+            `
+            INSERT INTO usuarios_equipamentos
+              (usuario_id, maquina_id, created_at, updated_at)
+            VALUES
+              (?, ?, NOW(), NOW())
+            `,
+            [Number(usuario_id), Number(maquinaId)]
+          ),
+          6000,
+          "db_timeout"
+        );
+      } catch (err) {
+        // aqui a estratégia é só logar o erro de vínculo
+        // e ainda assim considerar o cadastro do equipamento como OK.
+        console.error(
+          "[POST /equipamentos] erro ao criar vínculo em usuarios_equipamentos",
+          err
+        );
+        // se você quiser que falhe tudo quando der erro aqui,
+        // teríamos que envolver tudo em transação.
+      }
+    }
+
     return res.status(201).json({
       ok: true,
-      id: result.insertId,
+      id: maquinaId,
       message: "Equipamento cadastrado com sucesso",
     });
   } catch (e) {
