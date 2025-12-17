@@ -63,6 +63,7 @@ function normalizeStatusToCode(input) {
   if (raw === "0" || raw === "ativo") return 0;
   if (raw === "1" || raw === "atendimento") return 1;
   if (raw === "2" || raw === "desativado") return 2;
+  if (raw === "3" || raw === "deletado") return 3;
   return 0;
 }
 
@@ -207,7 +208,7 @@ app.get("/health", async (_req, res) => {
 
 app.get("/equipamentos", async (req, res) => {
   try {
-    const { limit, offset } = parseLimitOffset(req);
+    const { limit, offset } = parseLimitOffset(req, 50, 10000);
 
     const sql = `
       SELECT
@@ -232,6 +233,7 @@ app.get("/equipamentos", async (req, res) => {
         m.updated_at
       FROM maquinas m
       LEFT JOIN cidades c ON c.id = m.cidade_id
+      WHERE m.status <> 3
       ORDER BY m.id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -287,7 +289,7 @@ app.post("/equipamentos", async (req, res) => {
     if (status == null) missing.push("status");
     // se quiser tornar obrigatório já agora, descomenta:
     // if (usuario_id == null) missing.push("usuario_id");
-
+    i;
     if (missing.length) {
       return res.status(400).json({
         ok: false,
@@ -300,7 +302,13 @@ app.post("/equipamentos", async (req, res) => {
     // unicidade por serialNumber
     const [dups] = await withTimeout(
       pool.execute(
-        "SELECT id FROM maquinas WHERE TRIM(serialNumber)=TRIM(?) LIMIT 1",
+        `
+        SELECT id
+        FROM maquinas
+        WHERE TRIM(serialNumber) = TRIM(?)
+          AND status <> 3
+        LIMIT 1
+        `,
         [serialNumber]
       ),
       4000,
@@ -438,29 +446,162 @@ app.put("/equipamentos/:id", async (req, res) => {
       return res.status(400).json({ ok: false, error: "ID inválido" });
     }
 
-    let { status } = req.body || {};
-    const updates = [];
-    const params = [];
+    const body = req.body || {};
+    const {
+      // campos do formulário
+      tipo_id,
+      nome,
+      serialNumber,
+      numeroNotaFiscal,
+      numeroSerieEquipamento,
+      cidade,
+      cidade_nome,
+      uf,
+      cep,
+      bairro,
+      endereco,
+      numero,
+      complemento,
+      data_instalacao,
+      status,
+      observacao,
+      usuario_id,
+    } = body;
 
-    if (status !== undefined) {
+    // 1) CASO 1: atualização simples de status (botões de Ativar/Desativar/Restaurar)
+    const onlyStatusUpdate =
+      Object.keys(body).length === 1 && typeof status !== "undefined";
+
+    if (onlyStatusUpdate) {
       const code = normalizeStatusToCode(status);
-      updates.push("status = ?");
-      params.push(code);
+      const [r] = await withTimeout(
+        pool.execute(
+          "UPDATE maquinas SET status = ?, updated_at = NOW() WHERE id = ? LIMIT 1",
+          [code, id]
+        ),
+        6000,
+        "db_timeout"
+      );
+
+      if (r.affectedRows === 0) {
+        return res.status(404).json({ ok: false, error: "Não encontrado" });
+      }
+
+      return res.json({
+        ok: true,
+        id,
+        mode: "status-only",
+        message: "Status atualizado com sucesso",
+      });
     }
 
-    if (updates.length === 0) {
+    // 2) CASO 2: atualização completa (vindo do formulário de edição)
+
+    const missing = [];
+    if (tipo_id == null) missing.push("tipo_id");
+    if (!nome) missing.push("nome");
+    if (!serialNumber) missing.push("serialNumber");
+    if (!data_instalacao) missing.push("data_instalacao");
+    if (status == null) missing.push("status");
+
+    if (missing.length) {
+      return res.status(400).json({
+        ok: false,
+        error: `Campos obrigatórios ausentes: ${missing.join(", ")}`,
+      });
+    }
+
+    const statusCode = normalizeStatusToCode(status);
+
+    // Verifica se já existe outro equipamento com o mesmo serialNumber
+    const [dups] = await withTimeout(
+      pool.execute(
+        "SELECT id FROM maquinas WHERE TRIM(serialNumber) = TRIM(?) AND id <> ? LIMIT 1",
+        [serialNumber, id]
+      ),
+      4000,
+      "db_timeout"
+    );
+
+    if (dups.length) {
       return res
-        .status(400)
-        .json({ ok: false, error: "Nenhum campo para atualizar" });
+        .status(409)
+        .json({ ok: false, error: "serialNumber já cadastrado" });
     }
 
-    updates.push("updated_at = NOW()");
-    params.push(id);
+    // ===== Resolver cidade (igual POST, mas opcional) =====
+    const cidadeTexto = (cidade ?? cidade_nome ?? "").toString().trim();
+    let cidadeId = null;
+    let ufFinal =
+      String(uf || "")
+        .trim()
+        .toUpperCase() || null;
 
+    if (cidadeTexto) {
+      let nomeCidade = cidadeTexto;
+      const slash = cidadeTexto.indexOf("/");
+
+      if (slash > 0) {
+        nomeCidade = cidadeTexto.slice(0, slash).trim();
+        ufFinal =
+          cidadeTexto
+            .slice(slash + 1)
+            .trim()
+            .toUpperCase() || ufFinal;
+      }
+
+      try {
+        const city = await ensureCityByName(pool, nomeCidade, ufFinal);
+        cidadeId = city?.id ?? null;
+      } catch (err) {
+        const msg = String(err?.message || err);
+        if (err && err._badRequest) {
+          return res.status(400).json({ ok: false, error: msg });
+        }
+        return res.status(409).json({ ok: false, error: msg });
+      }
+    }
+
+    // ===== UPDATE em maquinas =====
     const [r] = await withTimeout(
       pool.execute(
-        `UPDATE maquinas SET ${updates.join(", ")} WHERE id = ? LIMIT 1`,
-        params
+        `
+        UPDATE maquinas
+           SET cidade_id = ?,
+               tipo_id = ?,
+               nome = ?,
+               serialNumber = ?,
+               numeroNotaFiscal = ?,
+               numeroSerieEquipamento = ?,
+               endereco = ?,
+               numero = ?,
+               bairro = ?,
+               cep = ?,
+               complemento = ?,
+               data_instalacao = ?,
+               status = ?,
+               observacao = ?,
+               updated_at = NOW()
+         WHERE id = ?
+         LIMIT 1
+        `,
+        [
+          cidadeId,
+          Number(tipo_id),
+          nome,
+          serialNumber,
+          numeroNotaFiscal || null,
+          numeroSerieEquipamento || null,
+          endereco || null,
+          numero || null,
+          bairro || null,
+          cep || null,
+          complemento || null,
+          data_instalacao,
+          statusCode,
+          observacao || null,
+          id,
+        ]
       ),
       6000,
       "db_timeout"
@@ -470,68 +611,148 @@ app.put("/equipamentos/:id", async (req, res) => {
       return res.status(404).json({ ok: false, error: "Não encontrado" });
     }
 
-    return res.json({
-      ok: true,
-      id,
-      message: "Equipamento atualizado com sucesso",
-    });
-  } catch (e) {
-    const isTimeout = e && String(e.message).includes("db_timeout");
-    console.error("[PUT /equipamentos/:id]", e);
-    return res.status(isTimeout ? 504 : 500).json({
-      ok: false,
-      error: isTimeout ? "MySQL timeout" : String(e.message || e),
-    });
-  }
-});
-
-app.delete("/equipamentos/:id", async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const hard = String(req.query.hard || "0") === "1";
-
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({ ok: false, error: "ID inválido" });
-    }
-
-    if (hard) {
-      const [result] = await withTimeout(
-        pool.execute("DELETE FROM maquinas WHERE id = ? LIMIT 1", [id]),
+    // ===== Atualizar vínculo com usuário, se enviado =====
+    if (typeof usuario_id !== "undefined") {
+      // limpa vínculos atuais
+      await withTimeout(
+        pool.execute("DELETE FROM usuarios_equipamentos WHERE maquina_id = ?", [
+          id,
+        ]),
         6000,
         "db_timeout"
       );
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ ok: false, error: "Não encontrado" });
+
+      if (usuario_id) {
+        await withTimeout(
+          pool.execute(
+            `
+            INSERT INTO usuarios_equipamentos
+              (usuario_id, maquina_id, created_at, updated_at)
+            VALUES (?, ?, NOW(), NOW())
+          `,
+            [Number(usuario_id), id]
+          ),
+          6000,
+          "db_timeout"
+        );
       }
+    }
+
+    return res.json({
+      ok: true,
+      id,
+      mode: "full-update",
+      message: "Equipamento atualizado com sucesso",
+    });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const isTimeout = msg.includes("db_timeout");
+    console.error("[PUT /equipamentos/:id]", e);
+    return res
+      .status(isTimeout ? 504 : 500)
+      .json({ ok: false, error: isTimeout ? "MySQL timeout" : msg });
+  }
+});
+
+// =============================================================================
+// DELETE /equipamentos/:id
+// - Se ?hard=1: apaga DE FATO a máquina
+//   -> antes, remove vínculos em usuarios_equipamentos
+// - Se não tiver ?hard=1: pode só fazer um "soft delete" (ex.: status=2)
+// =============================================================================
+app.delete("/equipamentos/:id", async (req, res) => {
+  const rawId = req.params.id;
+  const { hard } = req.query;
+
+  const id = Number(rawId);
+  if (!id || Number.isNaN(id)) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "ID inválido para equipamento." });
+  }
+
+  const isHard = String(hard) === "1";
+
+  try {
+    if (isHard) {
+      // =========================
+      // DELETE LÓGICO DEFINITIVO
+      // =========================
+      // status = 3  => "Deletado"
+      // remove vínculo com usuário
+      // mantém histórico (informacoes)
+      // =========================
+
+      const [update] = await withTimeout(
+        pool.execute(
+          "UPDATE maquinas SET status = 3, updated_at = NOW() WHERE id = ?",
+          [id]
+        ),
+        6000,
+        "db_timeout"
+      );
+
+      const affected =
+        (update && update.affectedRows) ||
+        (Array.isArray(update) ? update[0]?.affectedRows : 0);
+
+      if (!affected) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Equipamento não encontrado." });
+      }
+
+      // remove vínculo com cliente (pra sumir do dash)
+      await withTimeout(
+        pool.execute("DELETE FROM usuarios_equipamentos WHERE maquina_id = ?", [
+          id,
+        ]),
+        6000,
+        "db_timeout"
+      );
+
       return res.json({
         ok: true,
         hard: true,
-        message: "Equipamento removido definitivamente",
+        deleted: true,
+        message: "Equipamento removido da visão do cliente.",
+      });
+    } else {
+      // =========================
+      // DESATIVAR (status = 2)
+      // =========================
+      const [result] = await withTimeout(
+        pool.execute(
+          "UPDATE maquinas SET status = ?, updated_at = NOW() WHERE id = ?",
+          ["2", id]
+        ),
+        6000,
+        "db_timeout"
+      );
+
+      const affected =
+        (result && result.affectedRows) ||
+        (Array.isArray(result) ? result[0]?.affectedRows : 0);
+
+      if (!affected) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Equipamento não encontrado." });
+      }
+
+      return res.json({
+        ok: true,
+        hard: false,
+        message: "Equipamento desativado.",
       });
     }
-
-    const [result] = await withTimeout(
-      pool.execute(
-        "UPDATE maquinas SET status = 2, updated_at = NOW() WHERE id = ? LIMIT 1",
-        [id]
-      ),
-      6000,
-      "db_timeout"
-    );
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ ok: false, error: "Não encontrado" });
-    }
-    return res.json({
-      ok: true,
-      hard: false,
-      message: "Equipamento movido para a lixeira",
-    });
   } catch (e) {
-    const isTimeout = e && String(e.message).includes("db_timeout");
+    const msg = String(e?.message || e);
+    const isTimeout = msg.includes("db_timeout");
     console.error("[DELETE /equipamentos/:id]", e);
     return res
       .status(isTimeout ? 504 : 500)
-      .json({ ok: false, error: isTimeout ? "MySQL timeout" : e.message });
+      .json({ ok: false, error: isTimeout ? "MySQL timeout" : msg });
   }
 });
 
