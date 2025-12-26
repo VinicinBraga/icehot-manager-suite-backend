@@ -150,7 +150,7 @@ async function ensureCityByName(pool, nomeCidadeRaw, ufRaw = null) {
 
 // ===== /ping
 app.get("/ping", (_req, res) => {
-  res.type("text").send("pong");
+  res.type("text").send("pong-v2-sem-deleted-at");
 });
 
 // ===== /diag
@@ -289,7 +289,6 @@ app.post("/equipamentos", async (req, res) => {
     if (status == null) missing.push("status");
     // se quiser tornar obrigatório já agora, descomenta:
     // if (usuario_id == null) missing.push("usuario_id");
-    i;
     if (missing.length) {
       return res.status(400).json({
         ok: false,
@@ -1099,6 +1098,54 @@ app.put("/usuarios/:id", async (req, res) => {
     return res.status(isTimeout ? 504 : 500).json({
       ok: false,
       error: isTimeout ? "MySQL timeout" : String(e.message || e),
+    });
+  }
+});
+
+// =============================================================================
+// DELETE /usuarios/:id
+// - Padrão: HARD DELETE (deleted_at = NOW())
+// =============================================================================
+app.delete("/usuarios/:id", async (req, res) => {
+  const id = Number(req.params.id);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ ok: false, error: "ID inválido" });
+  }
+
+  try {
+    // 1️⃣ remove vínculos com equipamentos
+    await withTimeout(
+      pool.execute("DELETE FROM usuarios_equipamentos WHERE usuario_id = ?", [
+        id,
+      ]),
+      8000,
+      "db_timeout"
+    );
+
+    // 2️⃣ remove o usuário definitivamente
+    const [r] = await withTimeout(
+      pool.execute("DELETE FROM users WHERE id = ? LIMIT 1", [id]),
+      8000,
+      "db_timeout"
+    );
+
+    if (r.affectedRows === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "Usuário não encontrado",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      message: "Usuário removido com sucesso",
+    });
+  } catch (e) {
+    console.error("[DELETE /usuarios/:id]", e);
+    return res.status(500).json({
+      ok: false,
+      error: "Erro ao remover usuário",
     });
   }
 });
