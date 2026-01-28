@@ -148,6 +148,50 @@ async function ensureCityByName(pool, nomeCidadeRaw, ufRaw = null) {
   return { id: res.insertId, nome: nomeCidade, uf };
 }
 
+// ✅ Garante que módulos do equipamento sejam SEMPRE "substituídos"
+// (sem depender de UNIQUE KEY / ON DUPLICATE KEY)
+async function replaceUserEquipModules(
+  pool,
+  { usuario_id, maquina_id, agua_gelada, agua_quente, agua_pet, aspersor }
+) {
+  const uid = Number(usuario_id);
+  const mid = Number(maquina_id);
+  if (!uid || !mid) return;
+
+  const gel = agua_gelada ? 1 : 0;
+  const que = agua_quente ? 1 : 0;
+  const pet = agua_pet ? 1 : 0;
+  const asp = aspersor ? 1 : 0;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // ✅ Mantém só 1 vínculo por equipamento (resolve o "tirar módulo não funciona")
+    await conn.execute(
+      `DELETE FROM usuarios_equipamentos WHERE maquina_id = ?`,
+      [mid]
+    );
+
+    await conn.execute(
+      `
+      INSERT INTO usuarios_equipamentos
+        (usuario_id, maquina_id, agua_gelada, agua_quente, agua_pet, created_at, updated_at)
+      VALUES
+        (?, ?, ?, ?, ?, NOW(), NOW())
+      `,
+      [uid, mid, gel, que, pet]
+    );
+
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
 // ===== /ping
 app.get("/ping", (_req, res) => {
   res.type("text").send("pong-v2-sem-deleted-at");
@@ -202,10 +246,6 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-/* =============================================================================
- * EQUIPAMENTOS
- * ========================================================================== */
-
 app.get("/equipamentos", async (req, res) => {
   try {
     const { limit, offset } = parseLimitOffset(req, 50, 10000);
@@ -238,7 +278,7 @@ app.get("/equipamentos", async (req, res) => {
       LIMIT ${limit} OFFSET ${offset}
     `;
 
-    const [rows] = await withTimeout(pool.query(sql), 6000, "db_timeout");
+    const [rows] = await withTimeout(pool.query(sql), 20000, "db_timeout");
 
     return res.json({ ok: true, data: rows, limit, offset });
   } catch (e) {
@@ -251,14 +291,98 @@ app.get("/equipamentos", async (req, res) => {
   }
 });
 
-/**
- * POST /equipamentos
- * - cidade é OPCIONAL (cidade_id pode ser NULL)
- * - se vier cidade e não existir, cria — mas para criar exige UF
- * - matching sem acentos/caixa
- * - aceita 'uf' no body ou no formato "Cidade/UF"
- * - AGORA: se vier usuario_id, cria vínculo na tabela usuarios_equipamentos
- */
+app.get("/equipamentos/:id/modules", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ error: "ID inválido" });
+
+    // 1) garantir que a máquina existe e pegar observacao
+    const [mRows] = await pool.query(
+      `
+      SELECT observacao
+      FROM maquinas
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [id]
+    );
+
+    if (!mRows || !mRows.length) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Equipamento não encontrado" });
+    }
+
+    const observacao = mRows[0]?.observacao ?? null;
+
+    // 2) vínculo mais recente (se existir)
+    const [ueRows] = await pool.query(
+      `
+      SELECT
+        usuario_id,
+        COALESCE(agua_gelada, 1) AS agua_gelada,
+        COALESCE(agua_quente, 1) AS agua_quente,
+        COALESCE(agua_pet, 1)    AS agua_pet
+      FROM usuarios_equipamentos
+      WHERE maquina_id = ?
+      ORDER BY updated_at DESC, created_at DESC
+      LIMIT 1
+      `,
+      [id]
+    );
+
+    // defaults se não existir vínculo
+    const usuario_id = ueRows?.[0]?.usuario_id ?? null;
+    const agua_gelada = ueRows?.[0]?.agua_gelada ?? 1;
+    const agua_quente = ueRows?.[0]?.agua_quente ?? 1;
+    const agua_pet = ueRows?.[0]?.agua_pet ?? 1;
+
+    // 3) aspersor "habilitado" pelo cadastro (guardado em maquinas.observacao)
+    let aspersorFromConfig = 0;
+    try {
+      const obj = observacao ? JSON.parse(observacao) : null;
+      aspersorFromConfig = obj?.aspersor ? 1 : 0;
+    } catch {
+      aspersorFromConfig = 0;
+    }
+
+    // 4) aspersor pela telemetria (se já existir registro em informacoes)
+    let aspersorFromTelemetry = 0;
+    try {
+      const [tRows] = await pool.query(
+        `
+        SELECT 1 AS has
+        FROM informacoes
+        WHERE maquina_id = ?
+          AND contador_acionamentos_aspersor IS NOT NULL
+        LIMIT 1
+        `,
+        [id]
+      );
+      aspersorFromTelemetry = tRows && tRows.length ? 1 : 0;
+    } catch {
+      aspersorFromTelemetry = 0;
+    }
+
+    // 5) regra final: aparece se telemetria já existe OU se foi marcado no cadastro
+    const aspersor = aspersorFromTelemetry || aspersorFromConfig ? 1 : 0;
+
+    return res.json({
+      ok: true,
+      data: {
+        usuario_id,
+        agua_gelada,
+        agua_quente,
+        agua_pet,
+        aspersor,
+      },
+    });
+  } catch (e) {
+    console.error("Erro em GET /equipamentos/:id/modules:", e);
+    return res.status(500).json({ error: "Erro ao buscar módulos" });
+  }
+});
+
 app.post("/equipamentos", async (req, res) => {
   try {
     const {
@@ -267,9 +391,9 @@ app.post("/equipamentos", async (req, res) => {
       serialNumber,
       numeroNotaFiscal,
       numeroSerieEquipamento,
-      cidade, // aceita 'cidade' (ou 'cidade_nome')
-      cidade_nome, // idem
-      uf, // pode vir separado
+      cidade,
+      cidade_nome,
+      uf,
       cep,
       bairro,
       endereco,
@@ -278,7 +402,11 @@ app.post("/equipamentos", async (req, res) => {
       data_instalacao,
       status,
       observacao,
-      usuario_id, // 👈 NOVO CAMPO PARA VÍNCULO COM USUÁRIO
+      usuario_id,
+      agua_gelada = 1,
+      agua_quente = 1,
+      agua_pet = 1,
+      aspersor = 0,
     } = req.body || {};
 
     const missing = [];
@@ -287,8 +415,7 @@ app.post("/equipamentos", async (req, res) => {
     if (!serialNumber) missing.push("serialNumber");
     if (!data_instalacao) missing.push("data_instalacao");
     if (status == null) missing.push("status");
-    // se quiser tornar obrigatório já agora, descomenta:
-    // if (usuario_id == null) missing.push("usuario_id");
+
     if (missing.length) {
       return res.status(400).json({
         ok: false,
@@ -346,16 +473,42 @@ app.post("/equipamentos", async (req, res) => {
         cidadeId = city?.id ?? null;
       } catch (err) {
         const msg = String(err?.message || err);
-        // erro de validação (ex.: UF obrigatória) -> 400
-        if (err && err._badRequest) {
+        if (err && err._badRequest)
           return res.status(400).json({ ok: false, error: msg });
-        }
-        // ambiguidade ou outro problema -> 409
         return res.status(409).json({ ok: false, error: msg });
       }
     }
 
-    // ===== INSERT em maquinas (cidade_id pode ser NULL)
+    // ===== Observacao JSON (aspersor habilitado)
+    // Guarda o que vier em observacao (texto) + aspersor
+    let observacaoFinal = null;
+    try {
+      const baseObj =
+        observacao && String(observacao).trim()
+          ? (() => {
+              try {
+                const parsed = JSON.parse(String(observacao));
+                return parsed && typeof parsed === "object"
+                  ? parsed
+                  : { texto: String(observacao) };
+              } catch {
+                return { texto: String(observacao) };
+              }
+            })()
+          : {};
+
+      baseObj.aspersor = !!(
+        aspersor === true ||
+        aspersor === 1 ||
+        aspersor === "1"
+      );
+      observacaoFinal = JSON.stringify(baseObj);
+    } catch {
+      // fallback seguro
+      observacaoFinal = JSON.stringify({ aspersor: !!aspersor });
+    }
+
+    // ===== INSERT em maquinas
     const [result] = await withTimeout(
       pool.execute(
         `
@@ -386,7 +539,7 @@ app.post("/equipamentos", async (req, res) => {
           complemento || null,
           data_instalacao,
           statusCode,
-          observacao || null,
+          observacaoFinal,
         ]
       ),
       6000,
@@ -395,32 +548,19 @@ app.post("/equipamentos", async (req, res) => {
 
     const maquinaId = (result && result.insertId) || null;
 
-    // ===== NOVO: criar vínculo em usuarios_equipamentos, se usuario_id vier
+    // ===== vínculo (sem aspersor pq essa coluna NÃO existe)
     if (usuario_id != null && maquinaId != null) {
-      try {
-        await withTimeout(
-          pool.execute(
-            `
-            INSERT INTO usuarios_equipamentos
-              (usuario_id, maquina_id, created_at, updated_at)
-            VALUES
-              (?, ?, NOW(), NOW())
-            `,
-            [Number(usuario_id), Number(maquinaId)]
-          ),
-          6000,
-          "db_timeout"
-        );
-      } catch (err) {
-        // aqui a estratégia é só logar o erro de vínculo
-        // e ainda assim considerar o cadastro do equipamento como OK.
-        console.error(
-          "[POST /equipamentos] erro ao criar vínculo em usuarios_equipamentos",
-          err
-        );
-        // se você quiser que falhe tudo quando der erro aqui,
-        // teríamos que envolver tudo em transação.
-      }
+      await withTimeout(
+        replaceUserEquipModules(pool, {
+          usuario_id: Number(usuario_id),
+          maquina_id: Number(maquinaId),
+          agua_gelada,
+          agua_quente,
+          agua_pet,
+        }),
+        6000,
+        "db_timeout"
+      );
     }
 
     return res.status(201).json({
@@ -447,7 +587,6 @@ app.put("/equipamentos/:id", async (req, res) => {
 
     const body = req.body || {};
     const {
-      // campos do formulário
       tipo_id,
       nome,
       serialNumber,
@@ -465,9 +604,13 @@ app.put("/equipamentos/:id", async (req, res) => {
       status,
       observacao,
       usuario_id,
+      agua_gelada,
+      agua_quente,
+      agua_pet,
+      aspersor,
     } = body;
 
-    // 1) CASO 1: atualização simples de status (botões de Ativar/Desativar/Restaurar)
+    // 1) atualização simples de status
     const onlyStatusUpdate =
       Object.keys(body).length === 1 && typeof status !== "undefined";
 
@@ -494,8 +637,7 @@ app.put("/equipamentos/:id", async (req, res) => {
       });
     }
 
-    // 2) CASO 2: atualização completa (vindo do formulário de edição)
-
+    // 2) atualização completa
     const missing = [];
     if (tipo_id == null) missing.push("tipo_id");
     if (!nome) missing.push("nome");
@@ -512,7 +654,7 @@ app.put("/equipamentos/:id", async (req, res) => {
 
     const statusCode = normalizeStatusToCode(status);
 
-    // Verifica se já existe outro equipamento com o mesmo serialNumber
+    // duplicidade de serialNumber
     const [dups] = await withTimeout(
       pool.execute(
         "SELECT id FROM maquinas WHERE TRIM(serialNumber) = TRIM(?) AND id <> ? LIMIT 1",
@@ -528,7 +670,7 @@ app.put("/equipamentos/:id", async (req, res) => {
         .json({ ok: false, error: "serialNumber já cadastrado" });
     }
 
-    // ===== Resolver cidade (igual POST, mas opcional) =====
+    // ===== Resolver cidade (opcional)
     const cidadeTexto = (cidade ?? cidade_nome ?? "").toString().trim();
     let cidadeId = null;
     let ufFinal =
@@ -554,14 +696,73 @@ app.put("/equipamentos/:id", async (req, res) => {
         cidadeId = city?.id ?? null;
       } catch (err) {
         const msg = String(err?.message || err);
-        if (err && err._badRequest) {
+        if (err && err._badRequest)
           return res.status(400).json({ ok: false, error: msg });
-        }
         return res.status(409).json({ ok: false, error: msg });
       }
     }
 
-    // ===== UPDATE em maquinas =====
+    // ===== Observacao JSON (merge do que já existe + aspersor)
+    // 1) pega observacao atual do banco
+    const [curRows] = await withTimeout(
+      pool.execute("SELECT observacao FROM maquinas WHERE id = ? LIMIT 1", [
+        id,
+      ]),
+      4000,
+      "db_timeout"
+    );
+
+    const curObs = curRows?.[0]?.observacao ?? null;
+
+    let mergedObsObj = {};
+    try {
+      if (curObs && String(curObs).trim()) {
+        try {
+          const parsed = JSON.parse(String(curObs));
+          mergedObsObj =
+            parsed && typeof parsed === "object"
+              ? parsed
+              : { texto: String(curObs) };
+        } catch {
+          mergedObsObj = { texto: String(curObs) };
+        }
+      }
+    } catch {
+      mergedObsObj = {};
+    }
+
+    // 2) se o payload trouxe observacao (texto ou json), mescla também
+    if (typeof observacao !== "undefined") {
+      try {
+        if (observacao && String(observacao).trim()) {
+          try {
+            const parsed = JSON.parse(String(observacao));
+            if (parsed && typeof parsed === "object")
+              mergedObsObj = { ...mergedObsObj, ...parsed };
+            else mergedObsObj.texto = String(observacao);
+          } catch {
+            mergedObsObj.texto = String(observacao);
+          }
+        }
+      } catch {
+        // ignora
+      }
+    }
+
+    // 3) aplica aspersor se veio no payload (não sobrescreve se não veio)
+    if (typeof aspersor !== "undefined") {
+      mergedObsObj.aspersor = !!(
+        aspersor === true ||
+        aspersor === 1 ||
+        aspersor === "1"
+      );
+    }
+
+    const observacaoFinal = Object.keys(mergedObsObj).length
+      ? JSON.stringify(mergedObsObj)
+      : null;
+
+    // ===== UPDATE maquinas
     const [r] = await withTimeout(
       pool.execute(
         `
@@ -598,7 +799,7 @@ app.put("/equipamentos/:id", async (req, res) => {
           complemento || null,
           data_instalacao,
           statusCode,
-          observacao || null,
+          observacaoFinal,
           id,
         ]
       ),
@@ -610,31 +811,19 @@ app.put("/equipamentos/:id", async (req, res) => {
       return res.status(404).json({ ok: false, error: "Não encontrado" });
     }
 
-    // ===== Atualizar vínculo com usuário, se enviado =====
-    if (typeof usuario_id !== "undefined") {
-      // limpa vínculos atuais
+    // ===== vínculo (sem aspersor pq NÃO existe coluna)
+    if (usuario_id != null) {
       await withTimeout(
-        pool.execute("DELETE FROM usuarios_equipamentos WHERE maquina_id = ?", [
-          id,
-        ]),
+        replaceUserEquipModules(pool, {
+          usuario_id: Number(usuario_id),
+          maquina_id: id,
+          agua_gelada,
+          agua_quente,
+          agua_pet,
+        }),
         6000,
         "db_timeout"
       );
-
-      if (usuario_id) {
-        await withTimeout(
-          pool.execute(
-            `
-            INSERT INTO usuarios_equipamentos
-              (usuario_id, maquina_id, created_at, updated_at)
-            VALUES (?, ?, NOW(), NOW())
-          `,
-            [Number(usuario_id), id]
-          ),
-          6000,
-          "db_timeout"
-        );
-      }
     }
 
     return res.json({
@@ -653,12 +842,6 @@ app.put("/equipamentos/:id", async (req, res) => {
   }
 });
 
-// =============================================================================
-// DELETE /equipamentos/:id
-// - Se ?hard=1: apaga DE FATO a máquina
-//   -> antes, remove vínculos em usuarios_equipamentos
-// - Se não tiver ?hard=1: pode só fazer um "soft delete" (ex.: status=2)
-// =============================================================================
 app.delete("/equipamentos/:id", async (req, res) => {
   const rawId = req.params.id;
   const { hard } = req.query;
@@ -754,10 +937,6 @@ app.delete("/equipamentos/:id", async (req, res) => {
       .json({ ok: false, error: isTimeout ? "MySQL timeout" : msg });
   }
 });
-
-/* =============================================================================
- * MODELOS
- * ========================================================================== */
 
 app.get("/modelos", async (req, res) => {
   try {
@@ -875,10 +1054,6 @@ app.delete("/modelos/:id", async (req, res) => {
       .json({ ok: false, error: isTimeout ? "MySQL timeout" : e.message });
   }
 });
-
-/* =============================================================================
- * USUÁRIOS
- * ========================================================================== */
 
 app.get("/usuarios", async (req, res) => {
   try {
