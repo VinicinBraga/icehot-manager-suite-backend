@@ -351,26 +351,7 @@ app.get("/equipamentos/:id/modules", async (req, res) => {
       aspersorFromConfig = 0;
     }
 
-    // 4) aspersor pela telemetria (se já existir registro em informacoes)
-    let aspersorFromTelemetry = 0;
-    try {
-      const [tRows] = await pool.query(
-        `
-        SELECT 1 AS has
-        FROM informacoes
-        WHERE maquina_id = ?
-          AND contador_acionamentos_aspersor IS NOT NULL
-        LIMIT 1
-        `,
-        [id]
-      );
-      aspersorFromTelemetry = tRows && tRows.length ? 1 : 0;
-    } catch {
-      aspersorFromTelemetry = 0;
-    }
-
-    // 5) regra final: aparece se telemetria já existe OU se foi marcado no cadastro
-    const aspersor = aspersorFromTelemetry || aspersorFromConfig ? 1 : 0;
+    const aspersor = aspersorFromConfig ? 1 : 0;
 
     return res.json({
       ok: true,
