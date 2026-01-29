@@ -12,7 +12,12 @@ app.use(
     origin: true,
     credentials: false,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Cache-Control",
+      "Pragma",
+    ],
   })
 );
 // Preflight universal
@@ -572,6 +577,99 @@ app.post("/equipamentos", async (req, res) => {
     const msg = String(e?.message || e);
     const isTimeout = msg.includes("db_timeout");
     console.error("[POST /equipamentos]", e);
+    return res
+      .status(isTimeout ? 504 : 500)
+      .json({ ok: false, error: isTimeout ? "MySQL timeout" : msg });
+  }
+});
+
+app.get("/equipamentos/:id/filtros/ultimo", async (req, res) => {
+  try {
+    const maquinaId = Number(req.params.id);
+    if (!Number.isInteger(maquinaId) || maquinaId <= 0) {
+      return res.status(400).json({ ok: false, error: "ID inválido" });
+    }
+
+    const [rows] = await withTimeout(
+      pool.execute(
+        `
+        SELECT
+        COALESCE(f.data, m.data_instalacao) AS data
+      FROM maquinas m
+      LEFT JOIN filtros f
+        ON f.maquina_id = m.id
+      WHERE m.id = ?
+      ORDER BY f.data DESC, f.updated_at DESC
+      LIMIT 1;
+        `,
+        [maquinaId]
+      ),
+      4000,
+      "db_timeout"
+    );
+
+    return res.json({
+      ok: true,
+      data: rows.length ? rows[0].data : null,
+    });
+  } catch (e) {
+    console.error("[GET /equipamentos/:id/filtros/ultimo]", e);
+    return res.status(500).json({ ok: false, error: "Erro ao buscar troca" });
+  }
+});
+
+app.post("/equipamentos/:id/filtros", async (req, res) => {
+  try {
+    const maquinaId = Number(req.params.id);
+    if (!Number.isInteger(maquinaId) || maquinaId <= 0) {
+      return res.status(400).json({ ok: false, error: "ID inválido" });
+    }
+
+    const { data, tipo, nome, vazao } = req.body || {};
+    if (!data) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Campo 'data' é obrigatório (YYYY-MM-DD)" });
+    }
+
+    // (opcional mas bom) valida se a máquina existe
+    const [exists] = await withTimeout(
+      pool.execute("SELECT id FROM maquinas WHERE id = ? LIMIT 1", [maquinaId]),
+      4000,
+      "db_timeout"
+    );
+    if (!exists.length) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Equipamento não encontrado." });
+    }
+
+    const tipoFinal = String(tipo ?? "-").trim() || "-";
+    const nomeFinal = String(nome ?? "-").trim() || "-";
+    const vazaoFinal = vazao == null ? null : String(vazao).trim();
+
+    const [result] = await withTimeout(
+      pool.execute(
+        `
+        INSERT INTO filtros (maquina_id, tipo, nome, data, vazao, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, NOW(), NOW())
+        `,
+        [maquinaId, tipoFinal, nomeFinal, data, vazaoFinal]
+      ),
+      6000,
+      "db_timeout"
+    );
+
+    return res.status(201).json({
+      ok: true,
+      id: result.insertId,
+      maquina_id: maquinaId,
+      message: "Troca de filtro registrada com sucesso",
+    });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const isTimeout = msg.includes("db_timeout");
+    console.error("[POST /equipamentos/:id/filtros]", e);
     return res
       .status(isTimeout ? 504 : 500)
       .json({ ok: false, error: isTimeout ? "MySQL timeout" : msg });
@@ -1277,10 +1375,6 @@ app.put("/usuarios/:id", async (req, res) => {
   }
 });
 
-// =============================================================================
-// DELETE /usuarios/:id
-// - Padrão: HARD DELETE (deleted_at = NOW())
-// =============================================================================
 app.delete("/usuarios/:id", async (req, res) => {
   const id = Number(req.params.id);
 
