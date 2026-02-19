@@ -285,7 +285,30 @@ app.get("/equipamentos", async (req, res) => {
 
     const [rows] = await withTimeout(pool.query(sql), 20000, "db_timeout");
 
-    return res.json({ ok: true, data: rows, limit, offset });
+    // ✅ EXPÕE lat/lng vindos de observacao (JSON) sem alterar a base
+    const data = (rows || []).map((r) => {
+      let lat = null;
+      let lng = null;
+
+      try {
+        const obj = r.observacao ? JSON.parse(String(r.observacao)) : null;
+        if (obj && typeof obj === "object") {
+          const latNum = obj.lat === "" || obj.lat == null ? null : Number(obj.lat);
+          const lngNum = obj.lng === "" || obj.lng == null ? null : Number(obj.lng);
+
+          if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
+            lat = latNum;
+            lng = lngNum;
+          }
+        }
+      } catch {
+        // ignora JSON inválido
+      }
+
+      return { ...r, lat, lng };
+    });
+
+    return res.json({ ok: true, data, limit, offset });
   } catch (e) {
     const isTimeout = e && String(e.message).includes("db_timeout");
     console.error("[GET /equipamentos]", e);
@@ -295,6 +318,7 @@ app.get("/equipamentos", async (req, res) => {
     });
   }
 });
+
 
 app.get("/equipamentos/:id/modules", async (req, res) => {
   try {
@@ -393,6 +417,8 @@ app.post("/equipamentos", async (req, res) => {
       agua_quente = 1,
       agua_pet = 1,
       aspersor = 0,
+      lat,
+      lng,
     } = req.body || {};
 
     const missing = [];
@@ -465,8 +491,7 @@ app.post("/equipamentos", async (req, res) => {
       }
     }
 
-    // ===== Observacao JSON (aspersor habilitado)
-    // Guarda o que vier em observacao (texto) + aspersor
+    // ===== Observacao JSON (aspersor + lat/lng)
     let observacaoFinal = null;
     try {
       const baseObj =
@@ -483,15 +508,35 @@ app.post("/equipamentos", async (req, res) => {
             })()
           : {};
 
+      // aspersor (já existia)
       baseObj.aspersor = !!(
         aspersor === true ||
         aspersor === 1 ||
         aspersor === "1"
       );
+
+      // ✅ NOVO: lat/lng opcionais no JSON
+      const latNum = lat === "" || lat == null ? null : Number(lat);
+      const lngNum = lng === "" || lng == null ? null : Number(lng);
+
+      if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
+        baseObj.lat = latNum;
+        baseObj.lng = lngNum;
+      }
+
       observacaoFinal = JSON.stringify(baseObj);
     } catch {
-      // fallback seguro
-      observacaoFinal = JSON.stringify({ aspersor: !!aspersor });
+      // fallback seguro (mantém aspersor; lat/lng só se vierem válidos)
+      const latNum = lat === "" || lat == null ? null : Number(lat);
+      const lngNum = lng === "" || lng == null ? null : Number(lng);
+
+      const obj = { aspersor: !!aspersor };
+      if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
+        obj.lat = latNum;
+        obj.lng = lngNum;
+      }
+
+      observacaoFinal = JSON.stringify(obj);
     }
 
     // ===== INSERT em maquinas
@@ -687,6 +732,8 @@ app.put("/equipamentos/:id", async (req, res) => {
       agua_quente,
       agua_pet,
       aspersor,
+      lat,
+      lng,
     } = body;
 
     // 1) atualização simples de status
@@ -781,12 +828,10 @@ app.put("/equipamentos/:id", async (req, res) => {
       }
     }
 
-    // ===== Observacao JSON (merge do que já existe + aspersor)
+    // ===== Observacao JSON (merge do que já existe + aspersor + lat/lng)
     // 1) pega observacao atual do banco
     const [curRows] = await withTimeout(
-      pool.execute("SELECT observacao FROM maquinas WHERE id = ? LIMIT 1", [
-        id,
-      ]),
+      pool.execute("SELECT observacao FROM maquinas WHERE id = ? LIMIT 1", [id]),
       4000,
       "db_timeout"
     );
@@ -816,9 +861,11 @@ app.put("/equipamentos/:id", async (req, res) => {
         if (observacao && String(observacao).trim()) {
           try {
             const parsed = JSON.parse(String(observacao));
-            if (parsed && typeof parsed === "object")
+            if (parsed && typeof parsed === "object") {
               mergedObsObj = { ...mergedObsObj, ...parsed };
-            else mergedObsObj.texto = String(observacao);
+            } else {
+              mergedObsObj.texto = String(observacao);
+            }
           } catch {
             mergedObsObj.texto = String(observacao);
           }
@@ -835,6 +882,24 @@ app.put("/equipamentos/:id", async (req, res) => {
         aspersor === 1 ||
         aspersor === "1"
       );
+    }
+
+    // ✅ 4) lat/lng opcionais: só mexe se vierem no payload
+    if (typeof lat !== "undefined" || typeof lng !== "undefined") {
+      const latNum = lat === "" || lat == null ? null : Number(lat);
+      const lngNum = lng === "" || lng == null ? null : Number(lng);
+
+      // se vierem válidos, grava
+      if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
+        mergedObsObj.lat = latNum;
+        mergedObsObj.lng = lngNum;
+      }
+
+      // opcional: permitir limpar enviando null/null
+      if (lat === null && lng === null) {
+        delete mergedObsObj.lat;
+        delete mergedObsObj.lng;
+      }
     }
 
     const observacaoFinal = Object.keys(mergedObsObj).length
