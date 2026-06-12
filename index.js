@@ -42,16 +42,58 @@ const pool = mysql.createPool({
   enableKeepAlive: true,
 });
 
+const DB_TIMEOUT_MS = Number(process.env.DB_TIMEOUT_MS || 8000);
+
 /** Utilitário de timeout para qualquer promise */
 function withTimeout(promise, ms, label = "timeout") {
+  let timer;
+
   return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
+    promise.finally(() => {
+      if (timer) clearTimeout(timer);
+    }),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(label)), ms);
+    }),
   ]);
 }
 
+/** Query com timeout forte: se travar, destrói a conexão MySQL */
+async function executeWithHardTimeout(sql, params = [], ms = 8000) {
+  const conn = await pool.getConnection();
+  let timer;
+
+  try {
+    const queryPromise = conn.execute(sql, params);
+
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        try {
+          conn.destroy();
+        } catch (_) {}
+        reject(new Error("db_timeout"));
+      }, ms);
+    });
+
+    const result = await Promise.race([queryPromise, timeoutPromise]);
+
+    if (timer) clearTimeout(timer);
+    conn.release();
+
+    return result;
+  } catch (e) {
+    if (timer) clearTimeout(timer);
+
+    try {
+      conn.destroy();
+    } catch (_) {}
+
+    throw e;
+  }
+}
+
 /** Helpers de paginação */
-function parseLimitOffset(req, defLimit = 50, maxLimit = 200) {
+function parseLimitOffset(req, defLimit = 50, maxLimit = 1000) {
   let limit = Number(req.query.limit ?? defLimit);
   let offset = Number(req.query.offset ?? 0);
   if (!Number.isInteger(limit) || limit <= 0) limit = defLimit;
@@ -285,28 +327,45 @@ app.get("/equipamentos", async (req, res) => {
 
     const [rows] = await withTimeout(pool.query(sql), 20000, "db_timeout");
 
-    // ✅ EXPÕE lat/lng vindos de observacao (JSON) sem alterar a base
-    const data = (rows || []).map((r) => {
-      let lat = null;
-      let lng = null;
+// ✅ EXPÕE campos extras vindos de observacao (JSON) sem alterar a base
+const data = (rows || []).map((r) => {
+  let lat = null;
+  let lng = null;
+  let pais = "Brasil";
+  let cidadeNomeObs = null;
 
-      try {
-        const obj = r.observacao ? JSON.parse(String(r.observacao)) : null;
-        if (obj && typeof obj === "object") {
-          const latNum = obj.lat === "" || obj.lat == null ? null : Number(obj.lat);
-          const lngNum = obj.lng === "" || obj.lng == null ? null : Number(obj.lng);
+  try {
+    const obj = r.observacao ? JSON.parse(String(r.observacao)) : null;
 
-          if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
-            lat = latNum;
-            lng = lngNum;
-          }
-        }
-      } catch {
-        // ignora JSON inválido
+    if (obj && typeof obj === "object") {
+      const latNum = obj.lat === "" || obj.lat == null ? null : Number(obj.lat);
+      const lngNum = obj.lng === "" || obj.lng == null ? null : Number(obj.lng);
+
+      if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
+        lat = latNum;
+        lng = lngNum;
       }
 
-      return { ...r, lat, lng };
-    });
+      if (typeof obj.pais === "string" && obj.pais.trim()) {
+        pais = obj.pais.trim();
+      }
+
+      if (typeof obj.cidade_nome === "string" && obj.cidade_nome.trim()) {
+        cidadeNomeObs = obj.cidade_nome.trim();
+      }
+    }
+  } catch {
+    // ignora JSON inválido
+  }
+
+  return {
+    ...r,
+    pais,
+    cidade_nome: r.cidade_nome || cidadeNomeObs,
+    lat,
+    lng,
+  };
+});
 
     return res.json({ ok: true, data, limit, offset });
   } catch (e) {
@@ -403,6 +462,7 @@ app.post("/equipamentos", async (req, res) => {
       numeroSerieEquipamento,
       cidade,
       cidade_nome,
+      pais,
       uf,
       cep,
       bairro,
@@ -459,37 +519,43 @@ app.post("/equipamentos", async (req, res) => {
         .json({ ok: false, error: "serialNumber já cadastrado" });
     }
 
-    // ===== Resolver cidade (opcional)
-    const cidadeTexto = (cidade ?? cidade_nome ?? "").toString().trim();
-    let cidadeId = null;
-    let ufFinal =
-      String(uf || "")
+  // ===== Resolver cidade (opcional)
+  const paisFinal = String(pais || "Brasil").trim() || "Brasil";
+  const isBrasil =
+    paisFinal.toLowerCase() === "brasil" ||
+    paisFinal.toLowerCase() === "brazil";
+
+  const cidadeTexto = (cidade ?? cidade_nome ?? "").toString().trim();
+  let cidadeId = null;
+  let ufFinal =
+    String(uf || "")
+      .trim()
+      .toUpperCase() || null;
+
+  // Para Brasil, mantém cidade/UF. Para outros países, salva cidade no JSON de observacao.
+  if (isBrasil && cidadeTexto) {
+    let nomeCidade = cidadeTexto;
+    const slash = cidadeTexto.indexOf("/");
+
+  if (slash > 0) {
+    nomeCidade = cidadeTexto.slice(0, slash).trim();
+    ufFinal =
+      cidadeTexto
+        .slice(slash + 1)
         .trim()
-        .toUpperCase() || null;
+        .toUpperCase() || ufFinal;
+  }
 
-    if (cidadeTexto) {
-      let nomeCidade = cidadeTexto;
-      const slash = cidadeTexto.indexOf("/");
-
-      if (slash > 0) {
-        nomeCidade = cidadeTexto.slice(0, slash).trim();
-        ufFinal =
-          cidadeTexto
-            .slice(slash + 1)
-            .trim()
-            .toUpperCase() || ufFinal;
-      }
-
-      try {
-        const city = await ensureCityByName(pool, nomeCidade, ufFinal);
-        cidadeId = city?.id ?? null;
-      } catch (err) {
-        const msg = String(err?.message || err);
-        if (err && err._badRequest)
-          return res.status(400).json({ ok: false, error: msg });
-        return res.status(409).json({ ok: false, error: msg });
-      }
-    }
+  try {
+    const city = await ensureCityByName(pool, nomeCidade, ufFinal);
+    cidadeId = city?.id ?? null;
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (err && err._badRequest)
+      return res.status(400).json({ ok: false, error: msg });
+    return res.status(409).json({ ok: false, error: msg });
+  }
+}
 
     // ===== Observacao JSON (aspersor + lat/lng)
     let observacaoFinal = null;
@@ -514,7 +580,16 @@ app.post("/equipamentos", async (req, res) => {
         aspersor === 1 ||
         aspersor === "1"
       );
-
+      
+      // país/cidade internacional sem alterar estrutura do MySQL
+      baseObj.pais = paisFinal;
+      
+      if (!isBrasil && cidadeTexto) {
+        baseObj.cidade_nome = cidadeTexto;
+      } else {
+        delete baseObj.cidade_nome;
+      }
+      
       // ✅ NOVO: lat/lng opcionais no JSON
       const latNum = lat === "" || lat == null ? null : Number(lat);
       const lngNum = lng === "" || lng == null ? null : Number(lng);
@@ -530,53 +605,56 @@ app.post("/equipamentos", async (req, res) => {
       const latNum = lat === "" || lat == null ? null : Number(lat);
       const lngNum = lng === "" || lng == null ? null : Number(lng);
 
-      const obj = { aspersor: !!aspersor };
+      const obj = { aspersor: !!aspersor, pais: paisFinal };
+
+      if (!isBrasil && cidadeTexto) {
+        obj.cidade_nome = cidadeTexto;
+      }
+      
       if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
         obj.lat = latNum;
         obj.lng = lngNum;
       }
-
-      observacaoFinal = JSON.stringify(obj);
+      
+      observacaoFinal = JSON.stringify(obj);  
     }
 
     // ===== INSERT em maquinas
-    const [result] = await withTimeout(
-      pool.execute(
-        `
-        INSERT INTO maquinas
-          (cidade_id, tipo_id, nome, serialNumber,
-           numeroNotaFiscal, numeroSerieEquipamento,
-           endereco, numero, bairro, cep, complemento,
-           data_instalacao, status, observacao,
-           created_at, updated_at)
-        VALUES
-          (?, ?, ?, ?,
-           ?, ?,
-           ?, ?, ?, ?, ?,
-           ?, ?, ?,
-           NOW(), NOW())
-        `,
-        [
-          cidadeId,
-          Number(tipo_id),
-          nome,
-          serialNumber,
-          numeroNotaFiscal || null,
-          numeroSerieEquipamento || null,
-          endereco || null,
-          numero || null,
-          bairro || null,
-          cep || null,
-          complemento || null,
-          data_instalacao,
-          statusCode,
-          observacaoFinal,
-        ]
-      ),
-      6000,
-      "db_timeout"
+    // ===== INSERT em maquinas
+    const [result] = await executeWithHardTimeout(
+      `
+      INSERT INTO maquinas
+        (cidade_id, tipo_id, nome, serialNumber,
+         numeroNotaFiscal, numeroSerieEquipamento,
+         endereco, numero, bairro, cep, complemento,
+         data_instalacao, status, observacao,
+         created_at, updated_at)
+      VALUES
+        (?, ?, ?, ?,
+         ?, ?,
+         ?, ?, ?, ?, ?,
+         ?, ?, ?,
+         NOW(), NOW())
+      `,
+      [
+        cidadeId,
+        Number(tipo_id),
+        nome,
+        serialNumber,
+        numeroNotaFiscal || null,
+        numeroSerieEquipamento || null,
+        endereco || null,
+        numero || null,
+        bairro || null,
+        cep || null,
+        complemento || null,
+        data_instalacao,
+        statusCode,
+        observacaoFinal,
+      ],
+      DB_TIMEOUT_MS
     );
-
+    
     const maquinaId = (result && result.insertId) || null;
 
     // ===== vínculo (sem aspersor pq essa coluna NÃO existe)
@@ -718,6 +796,7 @@ app.put("/equipamentos/:id", async (req, res) => {
       numeroSerieEquipamento,
       cidade,
       cidade_nome,
+      pais,
       uf,
       cep,
       bairro,
@@ -797,17 +876,23 @@ app.put("/equipamentos/:id", async (req, res) => {
     }
 
     // ===== Resolver cidade (opcional)
+    const paisFinal = String(pais || "Brasil").trim() || "Brasil";
+    const isBrasil =
+      paisFinal.toLowerCase() === "brasil" ||
+      paisFinal.toLowerCase() === "brazil";
+      
     const cidadeTexto = (cidade ?? cidade_nome ?? "").toString().trim();
     let cidadeId = null;
     let ufFinal =
       String(uf || "")
         .trim()
         .toUpperCase() || null;
-
-    if (cidadeTexto) {
+      
+    // Para Brasil, mantém cidade/UF. Para outros países, salva cidade no JSON de observacao.
+    if (isBrasil && cidadeTexto) {
       let nomeCidade = cidadeTexto;
       const slash = cidadeTexto.indexOf("/");
-
+    
       if (slash > 0) {
         nomeCidade = cidadeTexto.slice(0, slash).trim();
         ufFinal =
@@ -816,7 +901,7 @@ app.put("/equipamentos/:id", async (req, res) => {
             .trim()
             .toUpperCase() || ufFinal;
       }
-
+    
       try {
         const city = await ensureCityByName(pool, nomeCidade, ufFinal);
         cidadeId = city?.id ?? null;
@@ -884,7 +969,22 @@ app.put("/equipamentos/:id", async (req, res) => {
       );
     }
 
-    // ✅ 4) lat/lng opcionais: só mexe se vierem no payload
+    // 4) país/cidade internacional sem alterar estrutura do MySQL
+    if (
+      typeof pais !== "undefined" ||
+      typeof cidade !== "undefined" ||
+      typeof cidade_nome !== "undefined"
+    ) {
+      mergedObsObj.pais = paisFinal;
+    
+      if (!isBrasil && cidadeTexto) {
+        mergedObsObj.cidade_nome = cidadeTexto;
+      } else {
+        delete mergedObsObj.cidade_nome;
+      }
+    }
+    
+    // ✅ 5) lat/lng opcionais: só mexe se vierem no payload
     if (typeof lat !== "undefined" || typeof lng !== "undefined") {
       const latNum = lat === "" || lat == null ? null : Number(lat);
       const lngNum = lng === "" || lng == null ? null : Number(lng);
