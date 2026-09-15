@@ -378,6 +378,128 @@ const data = (rows || []).map((r) => {
   }
 });
 
+// ============================================================
+// MÓDULOS EM LOTE
+// Evita 1 chamada HTTP + 2 consultas MySQL para cada equipamento
+// Uso: GET /equipamentos/modules?ids=183,230,231
+// ============================================================
+app.get("/equipamentos/modules", async (req, res) => {
+  try {
+    const rawIds = String(req.query.ids || "");
+
+    const ids = [
+      ...new Set(
+        rawIds
+          .split(",")
+          .map((id) => Number(id.trim()))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      ),
+    ];
+
+    if (!ids.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "Informe pelo menos um ID em ?ids=1,2,3",
+      });
+    }
+
+    // Proteção contra chamadas exageradamente grandes
+    if (ids.length > 1000) {
+      return res.status(400).json({
+        ok: false,
+        error: "Máximo de 1000 equipamentos por chamada",
+      });
+    }
+
+    const placeholders = ids.map(() => "?").join(",");
+
+    // 1 consulta para buscar TODAS as máquinas
+    const [mRows] = await executeWithHardTimeout(
+      `
+      SELECT
+        id,
+        observacao
+      FROM maquinas
+      WHERE id IN (${placeholders})
+      `,
+      ids,
+      DB_TIMEOUT_MS
+    );
+
+    // 1 consulta para buscar TODOS os vínculos
+    const [ueRows] = await executeWithHardTimeout(
+      `
+      SELECT
+        maquina_id,
+        usuario_id,
+        COALESCE(agua_gelada, 1) AS agua_gelada,
+        COALESCE(agua_quente, 1) AS agua_quente,
+        COALESCE(agua_pet, 1) AS agua_pet,
+        updated_at,
+        created_at
+      FROM usuarios_equipamentos
+      WHERE maquina_id IN (${placeholders})
+      ORDER BY maquina_id, updated_at DESC, created_at DESC
+      `,
+      ids,
+      DB_TIMEOUT_MS
+    );
+
+    // Mantém apenas o vínculo mais recente de cada máquina
+    const vinculoPorMaquina = new Map();
+
+    for (const row of ueRows) {
+      const maquinaId = Number(row.maquina_id);
+
+      if (!vinculoPorMaquina.has(maquinaId)) {
+        vinculoPorMaquina.set(maquinaId, row);
+      }
+    }
+
+    const data = mRows.map((machine) => {
+      const maquinaId = Number(machine.id);
+      const vinculo = vinculoPorMaquina.get(maquinaId);
+
+      let aspersor = 0;
+
+      try {
+        const config = machine.observacao
+          ? JSON.parse(machine.observacao)
+          : null;
+
+        aspersor = config?.aspersor ? 1 : 0;
+      } catch {
+        aspersor = 0;
+      }
+
+      return {
+        maquina_id: maquinaId,
+        usuario_id: vinculo?.usuario_id ?? null,
+        agua_gelada: vinculo?.agua_gelada ?? 1,
+        agua_quente: vinculo?.agua_quente ?? 1,
+        agua_pet: vinculo?.agua_pet ?? 1,
+        aspersor,
+      };
+    });
+
+    return res.json({
+      ok: true,
+      count: data.length,
+      data,
+    });
+  } catch (e) {
+    const isTimeout = String(e?.message || "").includes("db_timeout");
+
+    console.error("Erro em GET /equipamentos/modules:", e);
+
+    return res.status(isTimeout ? 504 : 500).json({
+      ok: false,
+      error: isTimeout
+        ? "MySQL timeout"
+        : "Erro ao buscar módulos dos equipamentos",
+    });
+  }
+});
 
 app.get("/equipamentos/:id/modules", async (req, res) => {
   try {
