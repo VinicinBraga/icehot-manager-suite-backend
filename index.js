@@ -3,13 +3,31 @@ const express = require("express");
 const cors = require("cors");
 const mysql = require("mysql2/promise");
 const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 
 const app = express();
+
+const isProduction = () => process.env.NODE_ENV === "production";
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_ISSUER = process.env.JWT_ISSUER || "icehot-api";
+const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "icehot-manager-suite";
+const JWT_ALGORITHM = "HS256";
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "30m";
+if (!JWT_SECRET) throw new Error("JWT_SECRET is required");
+
+const allowedOrigins = String(process.env.ALLOWED_ORIGINS || "")
+  .split(",").map((v) => v.trim()).filter(Boolean);
+if (!isProduction()) allowedOrigins.push("http://localhost:5173", "http://127.0.0.1:5173");
+// Cloud Run is behind one trusted proxy; rate limiting remains per instance, not global.
+app.set("trust proxy", 1);
 
 // ===== CORS / JSON
 app.use(
   cors({
-    origin: true,
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error("Origin not allowed"));
+    },
     credentials: false,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: [
@@ -27,6 +45,66 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
+
+// Lightweight per-instance limiter; use a shared limiter at the edge for multi-instance production.
+const rateBuckets = new Map();
+function rateLimit({ windowMs, max, keyPrefix }) {
+  return (req, res, next) => {
+    const key = `${keyPrefix}:${req.ip}`;
+    const now = Date.now();
+    const bucket = rateBuckets.get(key);
+    if (!bucket || now >= bucket.resetAt) rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    else bucket.count += 1;
+    const current = rateBuckets.get(key);
+    if (current.count > max) {
+      res.set("Retry-After", String(Math.ceil((current.resetAt - now) / 1000)));
+      return res.status(429).json({ ok: false, error: "Muitas requisições. Tente novamente mais tarde." });
+    }
+    return next();
+  };
+}
+
+function publicUser(user) {
+  return { id: user.id, name: user.name, email: user.email, type: Number(user.type), photo: user.photo ?? null };
+}
+
+function authenticate(req, res, next) {
+  if (["/health", "/ping", "/auth/login"].includes(req.path)) return next();
+  const value = req.get("authorization") || "";
+  if (!value.startsWith("Bearer ")) return res.status(401).json({ ok: false, error: "Não autenticado" });
+  try {
+    req.auth = jwt.verify(value.slice(7), JWT_SECRET, {
+      algorithms: [JWT_ALGORITHM], issuer: JWT_ISSUER, audience: JWT_AUDIENCE,
+    });
+    return next();
+  } catch (_) {
+    return res.status(401).json({ ok: false, error: "Token inválido ou expirado" });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (req.auth && Number(req.auth.type) === 1) return next();
+  return res.status(403).json({ ok: false, error: "Permissão insuficiente" });
+}
+
+app.use(rateLimit({ windowMs: Number(process.env.RATE_LIMIT_API_WINDOW_MS || 60000), max: Number(process.env.RATE_LIMIT_API_MAX || 120), keyPrefix: "api" }));
+app.use(authenticate);
+
+app.post("/auth/login", rateLimit({ windowMs: Number(process.env.RATE_LIMIT_LOGIN_WINDOW_MS || 900000), max: Number(process.env.RATE_LIMIT_LOGIN_MAX || 10), keyPrefix: "login" }), async (req, res) => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (!email || !password || email.length > 191 || password.length > 1024) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
+  try {
+    const [rows] = await pool.execute("SELECT id, name, email, password, type, photo FROM users WHERE email = ? LIMIT 1", [email]);
+    const user = rows[0];
+    const valid = user && Number(user.type) && await bcrypt.compare(password, user.password);
+    if (!valid || ![1, 2].includes(Number(user.type))) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
+    const token = jwt.sign({ sub: String(user.id), email: user.email, type: Number(user.type) }, JWT_SECRET, { algorithm: JWT_ALGORITHM, expiresIn: JWT_EXPIRES_IN, issuer: JWT_ISSUER, audience: JWT_AUDIENCE });
+    return res.json({ ok: true, token, user: publicUser(user) });
+  } catch (e) { console.error("[POST /auth/login] failed", e.code || "error"); return res.status(500).json({ ok: false, error: "Erro ao autenticar" }); }
+});
+
+app.get("/auth/me", (req, res) => res.json({ ok: true, user: { id: Number(req.auth.sub), email: req.auth.email, type: Number(req.auth.type) } }));
 
 // ===== MySQL Pool (com timeout)
 const pool = mysql.createPool({
@@ -246,6 +324,8 @@ app.get("/ping", (_req, res) => {
 
 // ===== /diag
 app.get("/diag", async (_req, res) => {
+  if (isProduction()) return res.sendStatus(404);
+  if (!_req.auth || Number(_req.auth.type) !== 1) return res.status(403).json({ ok: false, error: "Permissão insuficiente" });
   const info = {
     MYSQL_HOST: process.env.MYSQL_HOST,
     MYSQL_PORT: process.env.MYSQL_PORT,
@@ -284,14 +364,18 @@ app.get("/health", async (_req, res) => {
       4000,
       "db_timeout"
     );
-    return res.json({ ok: true, db: rows?.[0]?.ok === 1 });
+    return res.json({ ok: rows?.[0]?.ok === 1 });
   } catch (e) {
     const isTimeout = e && String(e.message).includes("db_timeout");
     return res
       .status(isTimeout ? 504 : 500)
-      .json({ ok: false, error: isTimeout ? "MySQL timeout" : e.message });
+      .json({ ok: false, error: "Health check failed" });
   }
 });
+
+app.use("/usuarios", requireAdmin);
+app.use("/modelos", (req, res, next) => req.method === "GET" ? next() : requireAdmin(req, res, next));
+app.use("/equipamentos", (req, res, next) => req.method === "GET" ? next() : requireAdmin(req, res, next));
 
 app.get("/equipamentos", async (req, res) => {
   try {
@@ -1314,7 +1398,8 @@ app.get("/modelos", async (req, res) => {
       LIMIT ${limit} OFFSET ${offset}
     `;
     const [rows] = await withTimeout(pool.query(sql), 6000, "db_timeout");
-    return res.json({ ok: true, data: rows, limit, offset });
+    const safeRows = rows.map(({ password: _password, ...user }) => user);
+    return res.json({ ok: true, data: safeRows, limit, offset });
   } catch (e) {
     const isTimeout = e && String(e.message).includes("db_timeout");
     console.error("[GET /modelos]", e);
@@ -1431,7 +1516,8 @@ app.get("/usuarios", async (req, res) => {
       LIMIT ${limit} OFFSET ${offset}
     `;
     const [rows] = await withTimeout(pool.query(sql), 6000, "db_timeout");
-    return res.json({ ok: true, data: rows, limit, offset });
+    const safeRows = rows.map(({ password: _password, ...user }) => user);
+    return res.json({ ok: true, data: safeRows, limit, offset });
   } catch (e) {
     const isTimeout = e && String(e.message).includes("db_timeout");
     console.error("[GET /usuarios]", e);
@@ -1691,22 +1777,23 @@ app.delete("/usuarios/:id", async (req, res) => {
 const port = Number(process.env.PORT || 8080);
 const host = "0.0.0.0";
 
-const server = app.listen(port, host, () => {
-  console.log(`ICEHOT API rodando em http://${host}:${port}`);
-});
+let server;
+if (require.main === module) {
+  server = app.listen(port, host, () => {
+    console.log(`ICEHOT API rodando em http://${host}:${port}`);
+  });
+}
 
-server.on("listening", () => {
-  console.log("[listen] ok");
-});
+if (server) server.on("listening", () => console.log("[listen] ok"));
 
-server.on("error", (err) => {
-  console.error("[listen] erro:", err);
-});
+if (server) server.on("error", (err) => console.error("[listen] erro", err.code || "error"));
 
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
 });
 
 process.on("unhandledRejection", (err) => {
-  console.error("[unhandledRejection]", err);
+  console.error("[unhandledRejection]", err && err.code ? err.code : "rejection");
 });
+
+module.exports = { app, pool };
