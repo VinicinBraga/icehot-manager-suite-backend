@@ -1,5 +1,7 @@
 
 .env
 .env.*
+!.env.example
 .env.yaml
 env.yaml
+node_modules/
